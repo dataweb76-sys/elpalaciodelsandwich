@@ -1,229 +1,233 @@
+// =========================================================
+// PEDIDOS – VERSIÓN OPTIMIZADA PARA EL PALACIO DEL SÁNDWICH
+// =========================================================
+
+const express = require("express");
+const router = express.Router();
+const db = require("../database");
+const { verifyToken } = require("./auth");
+
 // ===============================
-// TOKEN DEL ADMIN
+// FUNCIONES UTILITARIAS
 // ===============================
-function getToken() {
-  return localStorage.getItem("token") || "";
+
+// Sanitiza texto básico
+const clean = (v) => (typeof v === "string" ? v.trim() : v);
+
+// Ejecutar SQL con Promesa
+function runAsync(sql, params = []) {
+  return new Promise((resolve, reject) => {
+    db.run(sql, params, function (err) {
+      if (err) reject(err);
+      else resolve(this);
+    });
+  });
+}
+
+function getAsync(sql, params = []) {
+  return new Promise((resolve, reject) => {
+    db.get(sql, params, (err, row) => {
+      if (err) reject(err);
+      else resolve(row);
+    });
+  });
 }
 
 // ===============================
-// ABRIR WHATSAPP WEB
+// VALIDADORES
 // ===============================
-function abrirWhatsApp(numero, mensaje) {
-  const num = numero.replace(/\D/g, "");
-  const url = `https://wa.me/549${num}?text=${encodeURIComponent(mensaje)}`;
-  window.open(url, "_blank");
+
+function validarItems(arr) {
+  return Array.isArray(arr) && arr.length > 0;
 }
 
-// ===============================
-// CARGAR PEDIDOS
-// ===============================
-async function cargarPedidos() {
+// Evita crashes y devuelve {"error": "..."}
+function safeResponse(res, callback) {
   try {
-    const res = await fetch("/pedidos", {
-      headers: { Authorization: "Bearer " + getToken() }
-    });
-
-    const pedidos = await res.json();
-    renderTabla(pedidos);
+    callback();
   } catch (e) {
-    console.error(e);
+    console.error("❌ Error interno:", e);
+    res.status(500).json({ error: "Error interno del servidor" });
   }
 }
 
-let idsPrevios = new Set();
+// =========================================================
+// 1) PEDIDO SIMPLE / COMPATIBILIDAD
+// =========================================================
 
-// ===============================
-// RENDER TABLA
-// ===============================
-function renderTabla(pedidos) {
-  const tbody = document.querySelector("#tablaPedidos tbody");
-  tbody.innerHTML = "";
+router.post("/", (req, res) =>
+  safeResponse(res, async () => {
+    const { nombre_cliente, items, total, forma_pago, pagado } = req.body;
 
-  const idsActuales = new Set();
+    if (!clean(nombre_cliente) || !validarItems(items) || total == null) {
+      return res.status(400).json({ error: "Datos incompletos del pedido" });
+    }
 
-  pedidos.forEach(p => {
-    idsActuales.add(p.id);
-    const tr = document.createElement("tr");
+    const fecha_hora = new Date().toISOString();
 
-    const esNuevo = !idsPrevios.has(p.id);
-    tr.className = esNuevo ? "nuevo-pedido" : "";
+    await runAsync(
+      `INSERT INTO pedidos (
+        nombre_cliente, telefono, direccion, hora_entrega,
+        forma_pago, total, envio, distancia_km,
+        items_json, comprobanteQR, tipo, estado, pagado, fecha_hora
+      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+      [
+        clean(nombre_cliente),
+        "",
+        "",
+        "",
+        forma_pago || "efectivo",
+        total,
+        0,
+        0,
+        JSON.stringify(items),
+        null,
+        "local",
+        "pendiente",
+        pagado ? 1 : 0,
+        fecha_hora,
+      ]
+    );
 
-    tr.innerHTML = `
-      <td>${p.id}</td>
-      <td>${p.nombre_cliente}</td>
-      <td><span class="tipo-badge tipo-${p.tipo}">${p.tipo}</span></td>
-      <td>$${p.total}</td>
-      <td>${p.forma_pago}</td>
-      <td>${p.estado}</td>
-      <td>${p.fecha_hora}</td>
-      <td>
-        <button onclick="verPedido(${p.id})">Ver</button>
-        ${
-          p.estado !== "entregado"
-            ? `<button onclick="marcarListo(${p.id})" class="btn-listo">Listo</button>`
-            : ""
-        }
-        <button onclick="marcarEnCamino(${p.id})" class="btn-camino">En camino</button>
-      </td>
-    `;
+    res.json({ ok: true });
+  })
+);
 
-    tbody.appendChild(tr);
-  });
+// =========================================================
+// 2) PEDIDO LOCAL
+// =========================================================
 
-  idsPrevios = idsActuales;
-}
-async function marcarListoConWhatsApp(id) {
-  try {
-    const res = await fetch("/pedidos", {
-      headers: { Authorization: "Bearer " + token }
+router.post("/local", (req, res) =>
+  safeResponse(res, async () => {
+    const { nombre, telefono, horaEntrega, carrito, total, formaPago } = req.body;
+
+    if (!clean(nombre) || !validarItems(carrito)) {
+      return res.status(400).json({ error: "Datos incompletos en pedido LOCAL" });
+    }
+
+    const fecha_hora = new Date().toISOString();
+
+    const result = await runAsync(
+      `INSERT INTO pedidos (
+        nombre_cliente, telefono, direccion, hora_entrega,
+        forma_pago, total, envio, distancia_km,
+        items_json, comprobanteQR, tipo, estado, pagado, fecha_hora
+      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+      [
+        clean(nombre),
+        clean(telefono || ""),
+        "",
+        clean(horaEntrega || ""),
+        formaPago || "efectivo",
+        total || 0,
+        0,
+        0,
+        JSON.stringify(carrito),
+        null,
+        "local",
+        "pendiente",
+        0,
+        fecha_hora,
+      ]
+    );
+
+    res.json({ ok: true, id: result.lastID });
+  })
+);
+
+// =========================================================
+// 3) PEDIDO DELIVERY
+// =========================================================
+
+router.post("/delivery", (req, res) =>
+  safeResponse(res, async () => {
+    const {
+      nombre,
+      telefono,
+      direccion,
+      formaPago,
+      envio,
+      distanciaKm,
+      totalFinal,
+      carrito,
+      comprobanteQR,
+      horaEntrega,
+    } = req.body;
+
+    if (!clean(nombre) || !clean(telefono) || !clean(direccion) || !validarItems(carrito)) {
+      return res.status(400).json({ error: "Datos incompletos para DELIVERY" });
+    }
+
+    const fecha_hora = new Date().toISOString();
+
+    const result = await runAsync(
+      `INSERT INTO pedidos (
+        nombre_cliente, telefono, direccion, hora_entrega,
+        forma_pago, total, envio, distancia_km,
+        items_json, comprobanteQR, tipo, estado, pagado, fecha_hora
+      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+      [
+        clean(nombre),
+        clean(telefono),
+        clean(direccion),
+        clean(horaEntrega || ""),
+        formaPago || "efectivo",
+        totalFinal || 0,
+        envio || 0,
+        distanciaKm || 0,
+        JSON.stringify(carrito),
+        comprobanteQR || null,
+        "delivery",
+        "pendiente",
+        0,
+        fecha_hora,
+      ]
+    );
+
+    res.json({ ok: true, id: result.lastID });
+  })
+);
+
+// =========================================================
+// 4) LISTAR PEDIDOS
+// =========================================================
+
+router.get("/", verifyToken, (req, res) =>
+  safeResponse(res, async () => {
+    const rows = await new Promise((resolve, reject) => {
+      db.all("SELECT * FROM pedidos ORDER BY id DESC", [], (err, rows) => {
+        if (err) reject(err);
+        else resolve(rows);
+      });
     });
-    
-    const pedidos = await res.json();
-    const p = pedidos.find(x => x.id === id);
-    if (!p) return;
+    res.json(rows);
+  })
+);
+// ==========================================
+// PEDIDOS POR HORA (HOY) – PARA ESTADÍSTICAS
+// ==========================================
+router.get("/por_hora", verifyToken, (req, res) => {
+  const hoy = new Date().toISOString().substring(0, 10); // yyyy-mm-dd
 
-    // Cambiar estado a listo
-    await fetch(`/pedidos_estado/listo/${id}`, {
-      method: "POST",
-      headers: { Authorization: "Bearer " + token }
-    });
-
-    // Enviar WhatsApp
-    enviarWhatsApp(p.nombre_cliente, p.telefono, p.total);
-
-    // Recargar tabla
-    cargarPedidos();
-  } catch (e) {
-    console.error("Error al marcar listo:", e);
-  }
-}
-
-// ===============================
-// VER DETALLE
-// ===============================
-async function verPedido(id) {
-  const res = await fetch("/pedidos", {
-    headers: { Authorization: "Bearer " + getToken() }
-  });
-  const pedidos = await res.json();
-  const p = pedidos.find(x => x.id === id);
-
-  if (!p) return;
-
-  const div = document.getElementById("detallePedido");
-  const items = JSON.parse(p.items_json || "[]");
-
-  let html = `
-    <strong>Cliente:</strong> ${p.nombre_cliente}<br>
-    <strong>Teléfono:</strong> ${p.telefono}<br>
-    <strong>Dirección:</strong> ${p.direccion}<br>
-    <strong>Estado:</strong> ${p.estado}<br><br>
-    <h4>Items</h4>
-  `;
-
-  items.forEach(i => {
-    html += `${i.cantidad} × ${i.nombre} - $${i.precio}<br>`;
-  });
-
-  div.innerHTML = html;
-  document.getElementById("modalPedido").style.display = "flex";
-}
-
-function cerrarModal() {
-  document.getElementById("modalPedido").style.display = "none";
-}
-
-// ===============================
-// MARCAR LISTO + ABRIR WHATSAPP
-// ===============================
-async function marcarListo(id) {
-  if (!confirm("¿Confirmar pedido listo?")) return;
-
-  const res = await fetch(`/pedidos_estado/listo/${id}`, {
-    method: "POST",
-    headers: { Authorization: "Bearer " + getToken() }
-  });
-
-  const data = await res.json();
-  if (!data.ok) return alert("Error al marcar como listo");
-
-  const p = data.pedido;
-
-  // construir mensaje
-  let pagoMsg = "";
-  if (p.forma_pago === "efectivo") pagoMsg = `El total es $${p.total}.`;
-  if (p.forma_pago === "tarjeta") pagoMsg = `Pagás con tarjeta al recibir ($${p.total}).`;
-  if (p.forma_pago === "qr") pagoMsg = p.pagado ? `Pago recibido ✔️` : `Recordá abonar $${p.total} por QR.`;
-
-  const mensaje = `
-Hola ${p.nombre_cliente}! 🥪
-Tu pedido ya está LISTO y sale hacia tu domicilio 🚗💨
-${pagoMsg}
-¡Gracias por elegirnos! ❤️
-`;
-
-  abrirWhatsApp(p.telefono, mensaje);
-  cargarPedidos();
-}
-
-// ===============================
-// MARCAR EN CAMINO + WHATSAPP
-// ===============================
-async function marcarEnCamino(id) {
-  const res = await fetch(`/pedidos_estado/encamino/${id}`, {
-    method: "POST",
-    headers: { Authorization: "Bearer " + getToken() }
-  });
-
-  const data = await res.json();
-  if (!data.ok) return alert("Error");
-
-  const p = data.pedido;
-
-  const mensaje = `
-Hola ${p.nombre_cliente}! 🚴‍♂️💨
-El repartidor ya está en camino.
-En unos minutos estará en tu domicilio.
-¡Muchas gracias! ❤️
-`;
-
-  abrirWhatsApp(p.telefono, mensaje);
-  cargarPedidos();
-}
-function enviarWhatsApp(nombre, telefono, total) {
-  if (!telefono) {
-    alert("El cliente no tiene teléfono cargado.");
-    return;
-  }
-
-  // Limpia caracteres
-  const num = telefono.replace(/\D/g, "");
-
-  const mensaje = `Hola ${nombre}! 🥪
-Tu pedido ya está LISTO y sale hacia tu domicilio. 🚗💨
-Total a pagar: $${total}.
-¡Gracias por elegirnos! ❤️`;
-
-  const url = `https://wa.me/549${num}?text=${encodeURIComponent(mensaje)}`;
-
-  window.open(url, "_blank");
-}
-
-
-// ===============================
-// LOGOUT Y VOLVER
-// ===============================
-function logout() {
-  localStorage.removeItem("token");
-  window.location.href = "login.html";
-}
-
-function goBack() {
-  window.location.href = "admin.html";
-}
-
-// ===============================
-window.addEventListener("DOMContentLoaded", () => {
-  cargarPedidos();
-  setInterval(cargarPedidos, 5000);
+  db.all(
+    `
+      SELECT 
+        strftime('%H', fecha_hora) AS hora,
+        COUNT(*) AS cantidad
+      FROM pedidos
+      WHERE fecha_hora LIKE ? || '%'
+      GROUP BY strftime('%H', fecha_hora)
+      ORDER BY hora ASC
+    `,
+    [hoy],
+    (err, rows) => {
+      if (err) {
+        console.error("Error obteniendo pedidos por hora:", err);
+        return res.status(500).json({ error: true });
+      }
+      res.json(rows);
+    }
+  );
 });
+
+module.exports = router;

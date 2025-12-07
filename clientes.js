@@ -1,256 +1,127 @@
-// =====================================================
-// COCINA.JS – COMPLETO, ORDENADO Y OPTIMIZADO
-// =====================================================
+const express = require("express");
+const router = express.Router();
+const db = require("../database");
+const { verifyToken } = require("./auth");
 
-// VALIDA LOGIN
-const token = localStorage.getItem("token");
-if (!token) window.location.href = "login.html";
-
-let ultimosIds = new Set();
-
-// ==============================
-// CARGAR PEDIDOS
-// ==============================
-async function cargarPedidosCocina() {
-  try {
-    const res = await fetch("/pedidos", {
-      headers: { Authorization: "Bearer " + token }
-    });
-
-    if (res.status === 401) {
-      alert("Sesión expirada");
-      localStorage.removeItem("token");
-      window.location.href = "login.html";
-      return;
-    }
-
-    let pedidos = await res.json();
-
-    // Filtrar solo los NO entregados
-    pedidos = pedidos.filter(p => p.estado !== "entregado");
-
-    renderPedidosCocina(pedidos);
-
-  } catch (e) {
-    console.error("Error cargando pedidos cocina:", e);
-  }
-}
-
-// ==============================
-// RENDERIZAR TARJETAS
-// ==============================
-function renderPedidosCocina(pedidos) {
-  const grid = document.getElementById("kitchenGrid");
-  const empty = document.getElementById("kitchenEmpty");
-
-  grid.innerHTML = "";
-
-  if (!pedidos.length) {
-    empty.style.display = "block";
-    return;
-  }
-  empty.style.display = "none";
-
-  const nuevosIds = new Set();
-
-  pedidos.forEach(p => {
-    nuevosIds.add(p.id);
-
-    const card = document.createElement("div");
-    card.className = "k-card";
-
-    // -------------------------------------------
-    // ALERTAS POR HORA DE ENTREGA
-    // -------------------------------------------
-    if (p.hora_entrega) {
-      try {
-        const ahora = new Date();
-        const [h, m] = p.hora_entrega.split(":");
-        const pedidoDate = new Date();
-        pedidoDate.setHours(Number(h), Number(m), 0, 0);
-
-        const diffMin = Math.floor((pedidoDate - ahora) / 60000);
-
-        if (diffMin <= 10 && diffMin >= 0) {
-          card.classList.add("alerta-hora");
-        }
-        if (diffMin < 0) {
-          card.classList.add("retrasado");
-        }
-      } catch (e) {
-        console.warn("Error interpretando hora_entrega:", p.hora_entrega);
+// ======================================
+// LISTAR CLIENTES  → GET /clientes
+// ======================================
+router.get("/", verifyToken, (req, res) => {
+  db.all(
+    `
+      SELECT 
+        id,
+        nombre,
+        telefono,
+        total_gastado,
+        cantidad_pedidos,
+        ultima_compra,
+        items_frecuentes_json
+      FROM clientes
+      ORDER BY total_gastado DESC
+    `,
+    [],
+    (err, rows) => {
+      if (err) {
+        console.error("Error obteniendo clientes:", err);
+        return res.status(500).json([]);
       }
+
+      // Normalizar por si hay nulls
+      const data = rows.map(r => ({
+        id: r.id,
+        nombre: r.nombre || "Sin nombre",
+        telefono: r.telefono || "",
+        total_gastado: Number(r.total_gastado || 0),
+        cantidad_pedidos: Number(r.cantidad_pedidos || 0),
+        ultima_compra: r.ultima_compra || null,
+        items_frecuentes_json: r.items_frecuentes_json || "[]"
+      }));
+
+      res.json(data);
     }
+  );
+});
 
-    // NUEVO PEDIDO → animación + sonido
-    if (!ultimosIds.has(p.id)) {
-      card.classList.add("nuevo");
-      const audio = document.getElementById("sonidoNuevo");
-      audio?.play().catch(() => {});
+// ======================================
+// HISTORIAL DE UN CLIENTE
+// GET /clientes/historial/:telefono
+// ======================================
+router.get("/historial/:tel", verifyToken, (req, res) => {
+  const tel = req.params.tel;
+
+  db.all(
+    `
+      SELECT 
+        id,
+        telefono,
+        nombre_cliente,
+        total,
+        items_json,
+        fecha,
+        admin,
+        tipo
+      FROM historial_clientes
+      WHERE telefono = ?
+      ORDER BY fecha DESC
+    `,
+    [tel],
+    (err, rows) => {
+      if (err) {
+        console.error("Error historial cliente:", err);
+        return res.status(500).json([]);
+      }
+      res.json(rows);
     }
+  );
+});
 
-    const estadoClass = getClaseEstado(p.estado);
-    const estadoLabel = (p.estado || "pendiente").toUpperCase();
+// ======================================
+// NOTAS DE CLIENTE
+// GET /clientes/notas/:telefono
+// POST /clientes/notas/:telefono
+// ======================================
 
-    // Items
-    let itemsHtml = "";
-    try {
-      const items = JSON.parse(p.items_json || "[]");
-      items.forEach(it => {
-        itemsHtml += `${it.cantidad} × ${it.nombre}<br>`;
-      });
-    } catch {
-      itemsHtml = "<em>Error leyendo items</em>";
+// GET /clientes/notas/:telefono
+router.get("/notas/:tel", verifyToken, (req, res) => {
+  const tel = req.params.tel;
+
+  db.all(
+    "SELECT * FROM notas_clientes WHERE telefono=? ORDER BY fecha DESC",
+    [tel],
+    (err, rows) => {
+      if (err) {
+        console.error("Error notas cliente:", err);
+        return res.status(500).json([]);
+      }
+      res.json(rows);
     }
+  );
+});
 
-    // Hora reg.
-    const hora = p.fecha_hora
-      ? new Date(p.fecha_hora).toLocaleTimeString("es-AR", {
-          hour: "2-digit",
-          minute: "2-digit"
-        })
-      : "-";
+// POST /clientes/notas/:telefono
+router.post("/notas/:tel", verifyToken, (req, res) => {
+  const tel = req.params.tel;
+  const { nota } = req.body || {};
+  const admin = req.user?.user || "admin";
+  const fecha = new Date().toISOString();
 
-    card.innerHTML = `
-      <div class="k-header-line">
-        <div>
-          <div class="k-id">#${p.id}</div>
-          <div class="k-nombre">${p.nombre_cliente || "---"}</div>
-        </div>
-
-        <div class="k-estado ${estadoClass}">
-          ${estadoLabel}
-        </div>
-      </div>
-
-      <div class="k-items">
-        <strong>Items:</strong><br>
-        ${itemsHtml}
-      </div>
-
-      <div class="k-info">
-        Hora pedido: ${hora}<br>
-        ${
-          p.hora_entrega
-            ? `<div class="k-hora-alert">⏰ Retiro: ${p.hora_entrega}</div>`
-            : ""
-        }
-      </div>
-
-      <div class="k-footer">
-        <button class="k-btn k-btn-prep" onclick="cambiarEstadoCocina(${p.id}, 'preparando')">Preparar</button>
-        <button class="k-btn k-btn-listo" onclick="marcarListoCocina(${p.id})">Listo</button>
-        <button class="k-btn k-btn-camino" onclick="cambiarEstadoCocina(${p.id}, 'en_camino')">En camino</button>
-        <button class="k-btn k-btn-entregado" onclick="cambiarEstadoCocina(${p.id}, 'entregado')">Entregado</button>
-        <button class="k-btn k-btn-print" onclick="imprimirComanda(${p.id})">🖨 Imprimir</button>
-      </div>
-    `;
-
-    grid.appendChild(card);
-  });
-
-  ultimosIds = nuevosIds;
-}
-
-// ==============================
-// CLASE SEGÚN ESTADO
-// ==============================
-function getClaseEstado(estado) {
-  switch ((estado || "").toLowerCase()) {
-    case "pendiente": return "estado-pendiente";
-    case "preparando": return "estado-preparando";
-    case "listo": return "estado-listo";
-    case "en_camino": return "en_camino";
-    default: return "estado-otro";
-  }
-}
-
-// ==============================
-// CAMBIAR ESTADO
-// ==============================
-async function cambiarEstadoCocina(id, estado) {
-  let comentario = prompt("Comentario opcional:") || "";
-
-  const rutas = {
-    preparando: `/pedidos_estado/preparando/${id}`,
-    listo: `/pedidos_estado/listo/${id}`,
-    en_camino: `/pedidos_estado/encamino/${id}`,
-    entregado: `/pedidos_estado/entregado/${id}`
-  };
-
-  const ruta = rutas[estado];
-  if (!ruta) return;
-
-  await fetch(ruta, {
-    method: "POST",
-    headers: {
-      "Content-Type": "application/json",
-      Authorization: "Bearer " + token
-    },
-    body: JSON.stringify({ comentario })
-  });
-
-  cargarPedidosCocina();
-}
-
-// ==============================
-// LISTO → ENVÍA WHATSAPP SOLO DELIVERY
-// ==============================
-async function marcarListoCocina(id) {
-  let comentario = prompt("Comentario opcional:") || "";
-
-  const res = await fetch("/pedidos", {
-    headers: { Authorization: "Bearer " + token }
-  });
-  const pedidos = await res.json();
-  const p = pedidos.find(x => x.id === id);
-  if (!p) return;
-
-  // Actualizar estado
-  await fetch(`/pedidos_estado/listo/${id}`, {
-    method: "POST",
-    headers: {
-      "Content-Type": "application/json",
-      Authorization: "Bearer " + token
-    },
-    body: JSON.stringify({ comentario })
-  });
-
-  // SOLO DELIVERY → WhatsApp
-  if (p.tipo === "delivery") {
-    enviarWhatsApp(p.nombre_cliente, p.telefono, p.total);
+  if (!nota || !nota.trim()) {
+    return res.status(400).json({ error: "Nota vacía" });
   }
 
-  cargarPedidosCocina();
-}
+  db.run(
+    `INSERT INTO notas_clientes (telefono, nota, admin, fecha)
+     VALUES (?, ?, ?, ?)`,
+    [tel, nota.trim(), admin, fecha],
+    (err) => {
+      if (err) {
+        console.error("Error insertando nota:", err);
+        return res.status(500).json({ error: true });
+      }
+      res.json({ ok: true });
+    }
+  );
+});
 
-// ==============================
-// WHATSAPP AUTOMÁTICO DELIVERY
-// ==============================
-function enviarWhatsApp(nombre, telefono, total) {
-  const num = telefono.replace(/\D/g, "");
-  const mensaje = `Hola ${nombre}! 🥪
-Tu pedido ya está LISTO y saldrá hacia tu domicilio 🚗💨
-Total: $${total}
-¡Gracias por elegirnos!`;
-
-  window.open(`https://wa.me/549${num}?text=${encodeURIComponent(mensaje)}`, "_blank");
-}
-
-// ==============================
-// IMPRIMIR COMANDA
-// ==============================
-async function imprimirComanda(id) {
-  const res = await fetch("/pedidos", {
-    headers: { Authorization: "Bearer " + token }
-  });
-
-  const pedidos = await res.json();
-  const p = pedidos.find(x => x.id === id);
-  if (!p) return;
-
-  let itemsHtml = "";
-  const items = JSON.parse(p.items_json || "[]");
-  items.forEach(it => {
-    itemsHtml += `${it.cantidad} × ${it.nombre}<br>`;
-  });
+module.exports = router;
